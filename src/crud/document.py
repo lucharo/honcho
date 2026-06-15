@@ -740,7 +740,11 @@ async def create_observations(
     # Generate embeddings in batch
     contents = [obs.content for obs in observations]
     try:
-        embeddings = await embedding_client.simple_batch_embed(contents)
+        # Storage path: truncate overlong content so the document still gets
+        # an embedding for the first N tokens rather than failing the save.
+        embeddings = await embedding_client.simple_batch_embed(
+            contents, truncate=True
+        )
     except ValueError as e:
         raise ValidationException(str(e)) from e
 

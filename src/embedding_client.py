@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import threading
 from collections import defaultdict
 from typing import NamedTuple
@@ -32,10 +33,13 @@ class _EmbeddingClient:
         if self.provider == "gemini":
             if api_key is None:
                 api_key = settings.LLM.GEMINI_API_KEY
-            if not api_key:
+            if api_key:
+                self.client: genai.Client | AsyncOpenAI = genai.Client(api_key=api_key)
+            elif os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true":
+                self.client = genai.Client(vertexai=True)
+            else:
                 raise ValueError("Gemini API key is required")
-            self.client: genai.Client | AsyncOpenAI = genai.Client(api_key=api_key)
-            self.model: str = "gemini-embedding-001"
+            self.model: str = settings.LLM.EMBEDDING_MODEL or "gemini-embedding-001"
             # Gemini has a 2048 token limit
             self.max_embedding_tokens: int = min(settings.MAX_EMBEDDING_TOKENS, 2048)
             # Gemini batch size is not documented, using conservative estimate
@@ -93,48 +97,112 @@ class _EmbeddingClient:
             )
             return response.data[0].embedding
 
-    async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
+    def _truncate_to_token_limit(
+        self, text: str, *, fraction: float = 0.85
+    ) -> str:
+        """
+        Truncate text to fit within the provider's max_embedding_tokens.
+
+        Used by storage paths where keeping a partial-content embedding is
+        preferable to losing the index entry entirely. A `fraction` < 1.0
+        leaves a safety margin to absorb the mismatch between tiktoken
+        (`o200k_base` here) and the provider's actual tokenizer — Gemini's
+        SentencePiece in particular can yield 10–25% more tokens than
+        tiktoken estimates for the same text. Default 0.85 leaves 15%.
+        """
+        tokens = self.encoding.encode(text)
+        target = max(1, int(self.max_embedding_tokens * fraction))
+        if len(tokens) <= target:
+            return text
+        return self.encoding.decode(tokens[:target])
+
+    async def _embed_one_batch(self, batch: list[str]) -> list[list[float]]:
+        """Send one batch to the provider and return the embeddings."""
+        out: list[list[float]] = []
+        if isinstance(self.client, genai.Client):
+            response = await self.client.aio.models.embed_content(
+                model=self.model,
+                contents=batch,  # pyright: ignore[reportArgumentType]
+                config={"output_dimensionality": 1536},
+            )
+            if response.embeddings:
+                for emb in response.embeddings:
+                    if emb.values:
+                        out.append(emb.values)
+        else:  # openai
+            response = await self.client.embeddings.create(
+                input=batch,
+                model=self.model,
+            )
+            out.extend([data.embedding for data in response.data])
+        return out
+
+    async def simple_batch_embed(
+        self,
+        texts: list[str],
+        *,
+        truncate: bool = False,
+    ) -> list[list[float]]:
         """
         Simple batch embedding for a list of text strings.
 
         Args:
             texts: List of text strings to embed
+            truncate: If True, silently truncate texts that exceed the
+                provider's token limit instead of raising. Use this on
+                storage paths where preserving an embedding for the
+                truncated content beats failing the whole save and losing
+                the observation/document from the vector index. If the
+                provider still rejects the (truncated) batch with a
+                token-limit error, the batch is re-truncated more
+                aggressively and retried once before giving up.
 
         Returns:
             List of embedding vectors corresponding to input texts
 
         Raises:
-            ValueError: If any text exceeds token limits
+            ValueError: If any text exceeds token limits and either
+                truncate=False, or the aggressive-retry truncation also
+                fails.
         """
+        if truncate:
+            texts = [self._truncate_to_token_limit(t) for t in texts]
+
         embeddings: list[list[float]] = []
 
         for i in range(0, len(texts), self.max_batch_size):
             batch = texts[i : i + self.max_batch_size]
             try:
-                if isinstance(self.client, genai.Client):
-                    # Type cast needed due to genai type signature complexity
-                    response = await self.client.aio.models.embed_content(
-                        model=self.model,
-                        contents=batch,  # pyright: ignore[reportArgumentType]
-                        config={"output_dimensionality": 1536},
-                    )
-                    if response.embeddings:
-                        for emb in response.embeddings:
-                            if emb.values:
-                                embeddings.append(emb.values)
-                else:  # openai
-                    response = await self.client.embeddings.create(
-                        input=batch,
-                        model=self.model,
-                    )
-                    embeddings.extend([data.embedding for data in response.data])
+                embeddings.extend(await self._embed_one_batch(batch))
             except Exception as e:
-                # Check if it's a token limit error and re-raise as ValueError for consistency
-                if "token" in str(e).lower():
-                    raise ValueError(
-                        f"Text content exceeds maximum token limit of {self.max_embedding_tokens}."
-                    ) from e
-                raise
+                if "token" not in str(e).lower():
+                    raise
+                if truncate:
+                    # Provider's tokenizer disagreed with ours by more than
+                    # the 15% default safety margin. Re-truncate hard and
+                    # retry once before declaring the batch dead.
+                    logger.warning(
+                        "Embedding batch over provider's token limit even after "
+                        "default truncation; retrying with 50%% safety factor."
+                    )
+                    aggressive = [
+                        self._truncate_to_token_limit(t, fraction=0.5)
+                        for t in batch
+                    ]
+                    try:
+                        embeddings.extend(await self._embed_one_batch(aggressive))
+                        continue
+                    except Exception as e2:
+                        if "token" not in str(e2).lower():
+                            raise
+                        e = e2
+                # Re-raise as ValueError for consistency with embed()
+                worst = max(batch, key=lambda t: len(self.encoding.encode(t)))
+                raise ValueError(
+                    f"Text content exceeds maximum token limit of "
+                    f"{self.max_embedding_tokens} "
+                    f"(got {len(self.encoding.encode(worst))} tokens)"
+                ) from e
 
         return embeddings
 
@@ -398,9 +466,14 @@ class EmbeddingClient:
         """Embed a single query string."""
         return await self._get_client().embed(query)
 
-    async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
+    async def simple_batch_embed(
+        self,
+        texts: list[str],
+        *,
+        truncate: bool = False,
+    ) -> list[list[float]]:
         """Simple batch embedding for a list of text strings."""
-        return await self._get_client().simple_batch_embed(texts)
+        return await self._get_client().simple_batch_embed(texts, truncate=truncate)
 
     async def batch_embed(
         self, id_resource_dict: dict[str, tuple[str, list[int]]]

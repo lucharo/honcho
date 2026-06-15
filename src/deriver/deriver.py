@@ -148,6 +148,14 @@ async def process_representation_tasks_batch(
         "ms",
     )
 
+    if response is None or response.content is None:
+        logger.warning(
+            "Deriver LLM call returned None for messages %s:%s — skipping",
+            earliest_message.id if earliest_message else "?",
+            latest_message.id if latest_message else "?",
+        )
+        return
+
     # Prometheus metrics
     if settings.METRICS.ENABLED:
         prometheus_metrics.record_deriver_tokens(

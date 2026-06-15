@@ -1,11 +1,16 @@
 import json
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 from anthropic import AsyncAnthropic
+try:
+    from anthropic import AsyncAnthropicVertex
+except ImportError:
+    AsyncAnthropicVertex = type("_Unavailable", (), {})  # never matches if not installed
 from anthropic.types import TextBlock, ThinkingBlock, ToolUseBlock
 from anthropic.types.message import Message as AnthropicMessage
 from anthropic.types.usage import Usage
@@ -256,6 +261,11 @@ if settings.LLM.ANTHROPIC_API_KEY:
         timeout=600.0,  # 10 minutes timeout for long-running operations
     )
     CLIENTS["anthropic"] = anthropic
+elif os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") and os.environ.get("CLOUD_ML_REGION"):
+    from anthropic import AsyncAnthropicVertex
+    # SDK reads ANTHROPIC_VERTEX_PROJECT_ID and CLOUD_ML_REGION from env
+    anthropic = AsyncAnthropicVertex(timeout=600.0)
+    CLIENTS["anthropic"] = anthropic
 
 if settings.LLM.OPENAI_API_KEY:
     openai_client = AsyncOpenAI(
@@ -278,6 +288,9 @@ if settings.LLM.VLLM_API_KEY and settings.LLM.VLLM_BASE_URL:
 
 if settings.LLM.GEMINI_API_KEY:
     google = genai.client.Client(api_key=settings.LLM.GEMINI_API_KEY)
+    CLIENTS["google"] = google
+elif os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true":
+    google = genai.client.Client(vertexai=True)
     CLIENTS["google"] = google
 
 if settings.LLM.GROQ_API_KEY:
@@ -780,6 +793,13 @@ async def _execute_tool_loop(
 
         # Make the call
         response = await call_func()
+
+        if response is None:
+            logger.warning(f"LLM call returned None on iteration {iteration + 1}/{max_tool_iterations}, retrying")
+            iteration += 1
+            if iteration >= max_tool_iterations:
+                raise ValueError(f"LLM call returned None after {max_tool_iterations} attempts")
+            continue
 
         # Accumulate tokens from this iteration
         total_input_tokens += response.input_tokens
@@ -1682,7 +1702,7 @@ async def honcho_llm_call_inner(
     non_system_messages: list[dict[str, Any]] = []
 
     match client:
-        case AsyncAnthropic():
+        case AsyncAnthropic() | AsyncAnthropicVertex():
             # Anthropic requires system messages to be passed as a top-level parameter
             # Extract system messages and non-system messages
             for msg in params["messages"]:
@@ -1758,6 +1778,10 @@ async def honcho_llm_call_inner(
             anthropic_response: AnthropicMessage = cast(
                 AnthropicMessage, await client.messages.create(**anthropic_params)
             )
+
+            if not anthropic_response or not anthropic_response.content:
+                logger.warning("Anthropic/Vertex returned empty response, params: model=%s", anthropic_params.get("model", "?"))
+                return None
 
             # Extract text content, thinking blocks, and tool use blocks from content blocks
             text_blocks: list[str] = []
@@ -2370,7 +2394,7 @@ async def handle_streaming_response(
         HonchoLLMCallStreamChunk: Individual chunks of the streaming response
     """
     match client:
-        case AsyncAnthropic():
+        case AsyncAnthropic() | AsyncAnthropicVertex():
             # Anthropic requires system messages as a top-level parameter
             messages = params["messages"]
             system_content = "\n\n".join(

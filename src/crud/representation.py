@@ -77,11 +77,13 @@ class RepresentationManager:
             for obs in all_observations
         ]
         try:
-            embeddings = await embedding_client.simple_batch_embed(observation_texts)
+            # Storage path: truncate overlong observations rather than dropping
+            # them — partial-content embedding beats losing the index entry.
+            embeddings = await embedding_client.simple_batch_embed(
+                observation_texts, truncate=True
+            )
         except ValueError as e:
-            raise exceptions.ValidationException(
-                f"Observation content exceeds maximum token limit of {settings.MAX_EMBEDDING_TOKENS}."
-            ) from e
+            raise exceptions.ValidationException(str(e)) from e
 
         batch_embed_duration = (time.perf_counter() - batch_embed_start) * 1000
         accumulate_metric(

@@ -188,7 +188,11 @@ async def _sync_documents(
     if docs_needing_embed:
         try:
             contents = [doc.content for doc in docs_needing_embed]
-            new_embeddings = await embedding_client.simple_batch_embed(contents)
+            # Storage path: truncate so reconciliation can heal even very
+            # long historical documents.
+            new_embeddings = await embedding_client.simple_batch_embed(
+                contents, truncate=True
+            )
 
             if len(new_embeddings) != len(docs_needing_embed):
                 logger.warning(
@@ -302,7 +306,11 @@ async def _sync_message_embeddings(
     if embs_needing_embed:
         try:
             contents = [emb.content for emb in embs_needing_embed]
-            new_embeddings = await embedding_client.simple_batch_embed(contents)
+            # Storage path: truncate so reconciliation can heal historical
+            # message embeddings even when they exceed provider token limits.
+            new_embeddings = await embedding_client.simple_batch_embed(
+                contents, truncate=True
+            )
 
             if len(new_embeddings) != len(embs_needing_embed):
                 logger.warning(
